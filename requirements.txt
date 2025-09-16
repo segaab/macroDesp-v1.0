@@ -6,3 +6,4 @@ pyarrow
 matplotlib
 reportlab
 scipy
+huggingface_hub
