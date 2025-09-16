@@ -199,7 +199,6 @@ def generate_synthetic(asset, start, end):
     df.to_parquet(path)
     return df
 
-
 # ---------------------------
 # Backtest engine
 # ---------------------------
