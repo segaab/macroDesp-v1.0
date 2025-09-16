@@ -213,3 +213,106 @@ with st.sidebar:
     slippage_bps = st.number_input("Slippage (bps)", value=50)
     margin_rate = st.number_input("Margin rate (fraction)", value=0.12)
     run_bt = st.button("Run Lehman / GFC backtest")
+
+if run_bt:
+    st.info("Generating data and running backtest...")
+
+    selected_assets = []
+    for s in sectors:
+        selected_assets += ASSET_MAP.get(s, [])
+    if not selected_assets:
+        st.error("Please select at least one sector.")
+    else:
+        start = SCENARIO["start"]
+        end = SCENARIO["end"]
+        price_data, calendar = load_price_matrix(selected_assets, start, end)
+
+        # ---------------------------
+        # Build MarketSnapshot from latest data
+        # ---------------------------
+        latest_idx = -1
+        futures_pct = {}
+        etf_prices = {}
+        etf_vols_rel = {}
+        financials_map = {}
+
+        for a in selected_assets:
+            df = price_data[a]
+            if len(df) >= 2:
+                today = df.iloc[-1]
+                prev = df.iloc[-2]
+                pct = 100.0 * (float(today["close"]) - float(prev["close"])) / float(prev["close"]) if prev["close"] != 0 else 0.0
+            else:
+                pct = 0.0
+            futures_pct[a] = round(pct, 3)
+            etf_prices[a] = float(df.iloc[-1]["close"])
+            vol_today = float(df.iloc[-1]["volume"])
+            vol_avg50 = float(df["volume"].rolling(50, min_periods=1).mean().iloc[-1])
+            etf_vols_rel[a] = round(vol_today / (vol_avg50 + 1e-9), 3)
+            if a == "XLF":
+                financials_map["XLF"] = round(pct, 3)
+
+        avg_recent_pct = np.mean([v for v in futures_pct.values()])
+        mortgage_rel_to_avg = 1.8 if avg_recent_pct <= -2.0 else 1.2 if avg_recent_pct <= -1.0 else 1.0
+
+        # Volatility proxy
+        vol_proxy = {}
+        all_rets = []
+        for a in selected_assets:
+            series = price_data[a]["close"].pct_change().dropna().tail(20)
+            rv = series.std() * np.sqrt(252) * 100 if len(series) > 1 else 20.0
+            vol_proxy[a] = round(rv, 2)
+            all_rets.extend(series.tolist())
+        vix_proxy = round(np.std(all_rets) * np.sqrt(252) * 100, 2) if all_rets else 20.0
+
+        treasuries = {"2y": 0.50, "10y": 1.5}
+        snapshot = MarketSnapshot(
+            timestamp=pd.Timestamp.now(),
+            futures=futures_pct,
+            etf_prices=etf_prices,
+            etf_volumes=etf_vols_rel,
+            credit_rating_changes={"RMBS": "unchanged"},
+            default_rates={"mortgage_rel_to_avg": mortgage_rel_to_avg},
+            financials=financials_map,
+            treasuries=treasuries,
+            volatility={"VIX": vix_proxy},
+            headlines=["Lehman files for bankruptcy", "Markets crash globally", "Credit spreads widen"]
+        )
+
+        # ---------------------------
+        # Run TraderMorningModel
+        # ---------------------------
+        config = RoutineConfig(
+            etf_volume_threshold=2.0,
+            default_rate_spike_threshold=1.5,
+            discretionary_risk_pct=0.01,
+            capital=initial_cap,
+            debug=True
+        )
+        trader_model = TraderMorningModel(config)
+        morning_summary = trader_model.run_morning_routine(snapshot)
+
+        st.subheader("Morning Model Summary")
+        st.json(morning_summary)
+
+        # Scale down allocation if discrepancy flagged
+        allocation_pct = 0.50 if not morning_summary["discrepancy"]["flag"] else 0.25
+        st.write(f"Allocation fraction used in backtest: {allocation_pct*100:.0f}%")
+
+        # ---------------------------
+        # Run backtest
+        # ---------------------------
+        backtest = SimpleShortBacktest(initial_capital=initial_cap,
+                                       slippage_bps=slippage_bps,
+                                       margin_rate=margin_rate,
+                                       allocation_pct=allocation_pct)
+        result = backtest.run(price_data, calendar)
+
+        st.subheader("Equity Curve")
+        st.line_chart(result["equity"]["equity"])
+
+        st.subheader("Backtest Metrics")
+        st.json(result["metrics"])
+
+        st.subheader("Sample Trades")
+        st.dataframe(result["trades"].head(20))
