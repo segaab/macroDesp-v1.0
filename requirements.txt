@@ -1,0 +1,8 @@
+streamlit>=1.25.0
+pandas>=2.0.0
+pyyaml
+numpy
+pyarrow
+matplotlib
+reportlab
+scipy
