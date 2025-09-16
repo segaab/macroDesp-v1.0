@@ -4,7 +4,7 @@ All-in-one Streamlit backtest for the Lehman / GFC scenario (short-only)
 with TraderMorningModel prerequisite gating.
 
 Dependencies:
-  pip install streamlit pandas numpy pyyaml pyarrow reportlab
+  pip install streamlit pandas numpy pyyaml pyarrow reportlab yahooquery
 Run:
   streamlit run backtest_gfc_onefile_with_morning_model.py
 """
@@ -16,6 +16,10 @@ from pathlib import Path
 from datetime import datetime
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+
+# ---------------------------
+# Add the TraderMorningModel framework (user provided)
+# ---------------------------
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 import datetime as _dt
@@ -23,51 +27,60 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 
-# ---------------------------
-# TraderMorningModel
-# ---------------------------
+# attempt to import yahooquery (optional). If missing, we'll fallback to synthetic.
+try:
+    from yahooquery import Ticker
+    HAS_YAHOOQUERY = True
+except Exception:
+    Ticker = None
+    HAS_YAHOOQUERY = False
+
 @dataclass
 class MarketSnapshot:
     timestamp: _dt.datetime
-    futures: Dict[str, float]
-    etf_prices: Dict[str, float]
-    etf_volumes: Dict[str, float]
-    credit_rating_changes: Dict[str, str]
-    default_rates: Dict[str, float]
-    financials: Dict[str, float]
-    treasuries: Dict[str, float]
-    volatility: Dict[str, float]
-    headlines: List[str]
+    futures: Dict[str, float]                    # e.g. {"ES": -0.8, "NQ": -1.2}  -> percent moves
+    etf_prices: Dict[str, float]                 # e.g. {"IYR": 80.2, "VNQ": 68.4}
+    etf_volumes: Dict[str, float]                # raw volume or relative-to-average
+    credit_rating_changes: Dict[str, str]        # e.g. {"RMBS": "unchanged"}
+    default_rates: Dict[str, float]              # e.g. {"mortgage_30d": 0.045} (fractions or rel-to-avg)
+    financials: Dict[str, float]                 # e.g. {"XLF": -2.1}
+    treasuries: Dict[str, float]                 # e.g. {"2y": 0.75, "10y": 1.8} yields
+    volatility: Dict[str, float]                 # e.g. {"VIX": 22.3}
+    headlines: List[str]                         # short list of important headlines
 
 @dataclass
 class RoutineConfig:
-    etf_volume_threshold: float = 2.0
-    default_rate_spike_threshold: float = 1.5
-    discretionary_risk_pct: float = 0.01
-    capital: float = 1_000_000
+    etf_volume_threshold: float = 2.0            # e.g. volume >= 2x normal is 'high'
+    default_rate_spike_threshold: float = 1.5    # e.g. 1.5x normal -> spike
+    discretionary_risk_pct: float = 0.01         # max risk per trade if trading (1% of capital)
+    capital: float = 1_000_000                   # example default account capital
     debug: bool = True
 
 @dataclass
 class TradeRecommendation:
     instrument: str
-    action: str
+    action: str                                   # e.g. 'buy_put', 'short_etf', 'buy_treasury'
     size_usd: float
     reason: str
     params: Dict[str, Any] = field(default_factory=dict)
 
-# ----- TraderMorningModel -----
 class TraderMorningModel:
     def __init__(self, config: RoutineConfig):
         self.config = config
         self.state: Dict[str, Any] = {}
         self.log = logging.getLogger("TraderMorningModel")
-        self.log.setLevel(logging.DEBUG if config.debug else logging.INFO)
+        if config.debug:
+            self.log.setLevel(logging.DEBUG)
+        else:
+            self.log.setLevel(logging.INFO)
 
+    # ---------- Core routine steps ----------
     def boot_systems(self):
         self.log.info("Booting systems: market feeds, OMS, execution, comms.")
         self.state['systems_ok'] = True
 
     def quick_body_reset(self):
+        # Placeholder for human routine (coffee, breathing)
         self.state['ready'] = True
         self.log.debug("Human: coffee & breathing done.")
 
@@ -87,57 +100,63 @@ class TraderMorningModel:
         return pnl
 
     def reconcile_positions(self):
+        # Stub: reconcile blotter <-> custody
         self.state['positions_ok'] = True
         self.log.debug("Positions reconciled and stale orders cleaned.")
 
+    # ---------- Decision logic (the "model" part) ----------
     def detect_discrepancy(self, snapshot: MarketSnapshot) -> Dict[str, Any]:
         result = {"flag": False, "score": 0.0, "reasons": []}
+
         mort_default = snapshot.default_rates.get("mortgage_rel_to_avg", None)
         if mort_default is not None and mort_default >= self.config.default_rate_spike_threshold:
             result['score'] += 1.0
             result['reasons'].append("mortgage_default_spike")
-        unchanged_count = sum(
-            1 for v in snapshot.credit_rating_changes.values()
-            if v.lower() in ("unchanged", "no change")
-        )
+
+        unchanged_count = sum(1 for v in snapshot.credit_rating_changes.values() if v.lower() in ("unchanged", "no change"))
         if unchanged_count >= 1 and mort_default and mort_default >= self.config.default_rate_spike_threshold:
             result['score'] += 1.0
             result['reasons'].append("ratings_lagging")
-        high_vol_etfs = [
-            etf for etf, vol in snapshot.etf_volumes.items()
-            if vol >= self.config.etf_volume_threshold
-        ]
+
+        high_vol_etfs = [etf for etf, vol in snapshot.etf_volumes.items() if vol >= self.config.etf_volume_threshold]
         if high_vol_etfs:
             result['score'] += 1.0
             result['reasons'].append("etf_high_volume")
             result['etf_list'] = high_vol_etfs
+
         if result['score'] >= 2.0:
             result['flag'] = True
+
         self.log.debug(f"Discrepancy detection: {result}")
         return result
 
-    def make_recommendations(self, snapshot: MarketSnapshot, discrepancy: Dict[str, Any]) -> List[TradeRecommendation]:
+    def make_recommendations(self, snapshot: MarketSnapshot, discrepancy: Dict[str,Any]) -> List[TradeRecommendation]:
         recs: List[TradeRecommendation] = []
         capital = self.config.capital
         risk_per_trade = capital * self.config.discretionary_risk_pct
+
         if discrepancy.get("flag"):
             reasons = discrepancy.get("reasons", [])
             self.log.info(f"ALERT: discrepancy flagged for reasons {reasons}")
+
             recs.append(TradeRecommendation(
                 instrument="TLT", action="buy", size_usd=risk_per_trade,
-                reason="flight-to-quality hedge (credit stress detected)"
+                reason="flight_to-quality hedge (credit stress detected)"
             ))
+
             for etf in discrepancy.get("etf_list", [])[:3]:
                 recs.append(TradeRecommendation(
                     instrument=etf, action="buy_put_spread", size_usd=risk_per_trade*0.5,
                     reason=f"cheap convexity on {etf} due to volume+default mismatch",
                     params={"expiry_weeks": 4, "width_pct": 3}
                 ))
+
             if snapshot.financials.get("XLF", 0.0) < -1.0:
                 recs.append(TradeRecommendation(
                     instrument="XLF", action="buy_puts", size_usd=risk_per_trade*0.75,
                     reason="protect banking exposure as financials underperform"
                 ))
+
             for etf in discrepancy.get("etf_list", [])[:2]:
                 recs.append(TradeRecommendation(
                     instrument=etf, action="short_etf", size_usd=risk_per_trade*0.5,
@@ -150,18 +169,21 @@ class TraderMorningModel:
                 instrument="IYR", action="watch", size_usd=0.0,
                 reason="Monitor real-estate ETF for signs of distribution"
             ))
+
         self.state['recommendations'] = recs
         self.log.debug(f"Recommendations: {recs}")
         return recs
 
-    def run_morning_routine(self, snapshot: MarketSnapshot) -> Dict[str, Any]:
+    def run_morning_routine(self, snapshot: MarketSnapshot) -> Dict[str,Any]:
         self.boot_systems()
         self.quick_body_reset()
         headlines = self.read_headlines(snapshot)
         pnl = self.risk_and_pnl_snapshot()
         self.reconcile_positions()
+
         discrepancy = self.detect_discrepancy(snapshot)
         recommendations = self.make_recommendations(snapshot, discrepancy)
+
         summary = {
             "timestamp": snapshot.timestamp.isoformat(),
             "headlines": headlines,
@@ -169,43 +191,16 @@ class TraderMorningModel:
             "discrepancy": discrepancy,
             "recommendations": [r.__dict__ for r in recommendations]
         }
+
         self.log.info("Routine complete. Ready for market open.")
         self.state['last_summary'] = summary
         return summary
 
 # ---------------------------
-# Config / Scenario (GFC)
-# ---------------------------
-SCENARIO = {
-    "preset": "GFC",
-    "label": "GFC (Lehman bankruptcy - Sep 15, 2008 → Mar 31, 2009)",
-    "start": "2008-09-15",
-    "end": "2009-03-31",
-    "tag": "gfc2008"
-}
-
-# Sector -> asset proxies
-ASSET_MAP = {
-    "Energy": ["CL"],                   # crude futures proxy
-    "Financials": ["XLF"],              # financial ETF proxy
-    "Industrials": ["XLI"],
-    "Consumer Discretionary": ["XLY"],
-    "Materials": ["XLB"],
-    "Real Estate": ["XLRE"],
-    "Technology": ["NQ"]                # Nasdaq futures proxy (tech)
-}
-
-# Output paths
-ROOT = Path(".")
-DATA_ROOT = ROOT / "data_placeholder"
-DOCS = ROOT / "docs"
-DATA_ROOT.mkdir(parents=True, exist_ok=True)
-DOCS.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------
-# Utilities: data generation / loader
+# Utilities: data generation / yahoofetch
 # ---------------------------
 def generate_synthetic(asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Generate synthetic daily business-day OHLCV for asset and persist to parquet for caching."""
     path = DATA_ROOT / f"{asset}.parquet"
     if path.exists():
         df = pd.read_parquet(path)
@@ -215,10 +210,11 @@ def generate_synthetic(asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd
     dates = pd.date_range(start=start, end=end, freq="B")
     n = len(dates)
     rng = np.random.RandomState(sum(bytearray(asset.encode())) % 2**32)
+    # drift negative to emulate GFC down pressure for risk assets (but keep variety)
     mu = -0.0008 if asset in ("XLF","XLRE") else -0.0003
     sigma = 0.03
     returns = rng.normal(loc=mu, scale=sigma, size=n)
-    price = 100.0 * np.exp(np.cumsum(returns))
+    price = 100.0 * np.exp(np.cumsum(returns))  # geometric walk
     vol = rng.randint(500, 5000, size=n)
     high = price * (1 + rng.rand(n) * 0.02)
     low = price * (1 - rng.rand(n) * 0.02)
@@ -234,16 +230,95 @@ def generate_synthetic(asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd
     df.to_parquet(path)
     return df
 
+def fetch_price_data_yahoo(symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
+    """
+    Try to fetch daily OHLCV from yahooquery for `symbol` between start and end (inclusive).
+    Returns DataFrame with columns ['date','open','high','low','close','volume'] or None on failure.
+    """
+    if not HAS_YAHOOQUERY:
+        return None
+    try:
+        t = Ticker(symbol)
+        hist = t.history(start=start, end=end, interval="1d")
+        if hist is None or len(hist) == 0:
+            return None
+        # yahooquery.history may return MultiIndex when multiple symbols requested;
+        # handle both single and multi symbol returns.
+        if isinstance(hist.index, pd.MultiIndex):
+            # pick the symbol's subset
+            if symbol in hist.index.get_level_values(0):
+                df = hist.xs(symbol, level=0)
+            else:
+                # if the symbol isn't present, return None
+                return None
+        else:
+            df = hist.copy()
+        # normalize and ensure columns exist
+        df = df.reset_index()
+        # some fields are 'adjclose' or 'close' depending on feed; prefer 'adjclose' if present
+        if 'adjclose' in df.columns:
+            df = df.rename(columns={'adjclose': 'close'})
+        # ensure required cols
+        expected = ['date','open','high','low','close','volume']
+        missing = [c for c in expected if c not in df.columns]
+        if missing:
+            # try best-effort mapping, otherwise fail
+            return None
+        df = df[['date','open','high','low','close','volume']].copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        return df
+    except Exception:
+        return None
+
 def load_price_matrix(selected_assets, start, end):
+    """
+    For each asset attempt to fetch via Yahoo; on failure generate synthetic and cache.
+    Returns dict asset -> DataFrame and calendar index.
+    """
     start_ts, end_ts = pd.to_datetime(start), pd.to_datetime(end)
     calendar = pd.date_range(start=start_ts, end=end_ts, freq="B")
     price_data = {}
     for asset in selected_assets:
-        df = generate_synthetic(asset, start_ts, end_ts)
-        df = df.set_index("date").sort_index()
-        df = df.reindex(calendar).ffill().bfill().reset_index().rename(columns={"index": "date"})
+        # attempt yahoo fetch
+        df = fetch_price_data_yahoo(asset, start, end)
+        if df is None:
+            # fallback to synthetic generator (keeps prior behavior)
+            df = generate_synthetic(asset, start_ts, end_ts)
+        # reindex to full calendar and forward-fill / backfill to avoid holes
+        df = df.set_index('date').sort_index()
+        df = df.reindex(calendar).ffill().bfill().reset_index().rename(columns={'index': 'date'})
         price_data[asset] = df
     return price_data, calendar
+
+# ---------------------------
+# Config / Scenario (GFC) — start set to one day BEFORE Lehman bankruptcy (2008-09-14)
+# ---------------------------
+SCENARIO = {
+    "preset": "GFC",
+    "label": "GFC (Lehman bankruptcy - Sep 15, 2008 → Mar 31, 2009)",
+    "start": "2008-09-14",
+    "end": "2009-03-31",
+    "tag": "gfc2008"
+}
+
+# Sector -> asset proxies
+ASSET_MAP = {
+    "Energy": ["CL"],                   # crude futures proxy (try symbol as-is; adjust to CL=F if you prefer)
+    "Financials": ["XLF"],              # financial ETF proxy
+    "Industrials": ["XLI"],
+    "Consumer Discretionary": ["XLY"],
+    "Materials": ["XLB"],
+    "Real Estate": ["XLRE"],
+    "Technology": ["NQ"]                # Nasdaq futures proxy (may be NQ=F on Yahoo)
+}
+
+# Output paths
+ROOT = Path(".")
+DATA_ROOT = ROOT / "data_placeholder"
+DOCS = ROOT / "docs"
+DATA_ROOT.mkdir(parents=True, exist_ok=True)
+DOCS.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------
 # Strategy: momentum_breakdown_signal
@@ -299,7 +374,10 @@ class SimpleShortBacktest:
                 per_asset_notional = total_short_notional / len(signaled)
                 for a in signaled:
                     price = closes[a][i]
-                    units = int(per_asset_notional / price) if price > 0 else 0
+                    if price <= 0:
+                        units = 0
+                    else:
+                        units = int(per_asset_notional / price)
                     target_positions[a] = -units
 
             for a in assets:
@@ -307,7 +385,10 @@ class SimpleShortBacktest:
                 tgt = target_positions[a]
                 if cur != tgt:
                     price = closes[a][i]
-                    exec_price = price * (1 - self.slippage) if tgt < cur else price * (1 + self.slippage)
+                    if tgt < cur:
+                        exec_price = price * (1 - self.slippage)
+                    else:
+                        exec_price = price * (1 + self.slippage)
                     cash += (cur - tgt) * exec_price
                     trades.append({
                         "date": pd.to_datetime(date),
@@ -344,7 +425,6 @@ class SimpleShortBacktest:
                         mtm = cash + sum([positions[a]*float(closes[a][i]) for a in assets])
 
             equity_series.append({"date": pd.to_datetime(date), "equity": mtm, "required_margin": required_margin})
-
         equity_df = pd.DataFrame(equity_series).set_index("date")
         metrics = self._compute_metrics(equity_df["equity"])
         trades_df = pd.DataFrame(trades)
@@ -383,7 +463,7 @@ with st.sidebar:
     discretionary_risk_pct = st.number_input("Discretionary risk % (per rec)", value=0.01)
     run_bt = st.button("Run Lehman / GFC backtest (with prerequisite)")
 
-st.markdown("**Notes:** The TraderMorningModel runs on a snapshot created from the synthetic data. If it flags a discrepancy, the backtest will *scale down* allocation automatically (50% → 25%) as the gating rule.")
+st.markdown("**Notes:** The TraderMorningModel runs on a snapshot created from the synthetic or Yahoo data. If it flags a discrepancy, the backtest will *scale down* allocation automatically (50% → 25%) as the gating rule.")
 
 if run_bt:
     st.info("Generating data, running morning model, then backtest...")
@@ -402,6 +482,7 @@ if run_bt:
         # Build MarketSnapshot from latest data (simple heuristics)
         # ---------------------------
         latest_idx = -1
+        # futures percent moves: compute pct change from prev day for each asset
         futures_pct = {}
         etf_prices = {}
         etf_vols_rel = {}
@@ -416,16 +497,22 @@ if run_bt:
                 pct = 0.0
             futures_pct[a] = round(pct, 3)
             etf_prices[a] = float(df.iloc[-1]["close"])
+            # compute vol_rel = today_vol / 50-day avg vol
             vol_today = float(df.iloc[-1]["volume"])
             vol_avg50 = float(df["volume"].rolling(50, min_periods=1).mean().iloc[-1])
             vol_rel = vol_today / (vol_avg50 + 1e-9)
             etf_vols_rel[a] = round(vol_rel, 3)
+            # financials mapping: if XLF present
             if a == "XLF":
                 financials_map["XLF"] = round(pct, 3)
 
+        # simple default proxy: if XLF or XLRE dropped sharply recently, mark default proxy high
         avg_recent_pct = np.mean([v for v in futures_pct.values()])
+        # heuristic: if avg drop worse than -2% -> default_rel ~1.8 else 1.0
         mortgage_rel_to_avg = 1.8 if avg_recent_pct <= -2.0 else 1.2 if avg_recent_pct <= -1.0 else 1.0
 
+        # treasuries and volatility proxies (placeholders derived from data)
+        # VIX proxy: use cross-asset realized vol (std of returns over last 20 business days) * sqrt(252)
         vol_proxy = {}
         all_rets = []
         for a in selected_assets:
@@ -438,11 +525,9 @@ if run_bt:
             all_rets.extend(series.tolist())
         vix_proxy = round(np.std(all_rets) * np.sqrt(252) * 100, 2) if all_rets else 20.0
 
-        treasuries = {"2y": 0.50, "10y": 1.50}
-        headlines = ["Lehman bankruptcy triggers market turmoil", "Financial stress indicators rising"]
-
+        treasuries = {"2y": 0.50, "10y": 1.80}
         snapshot = MarketSnapshot(
-            timestamp=pd.Timestamp.now(),
+            timestamp=pd.to_datetime(end),
             futures=futures_pct,
             etf_prices=etf_prices,
             etf_volumes=etf_vols_rel,
@@ -451,40 +536,74 @@ if run_bt:
             financials=financials_map,
             treasuries=treasuries,
             volatility={"VIX": vix_proxy},
-            headlines=headlines
+            headlines=[
+                "Lehman files for bankruptcy protection",
+                "Credit markets seize up",
+                "Fed announces emergency liquidity facilities",
+                "Bank funding stress intensifies",
+            ]
         )
 
         # ---------------------------
-        # Run TraderMorningModel
+        # Run morning model
         # ---------------------------
-        config = RoutineConfig(
+        cfg = RoutineConfig(
             etf_volume_threshold=etf_vol_threshold,
             default_rate_spike_threshold=default_rate_threshold,
             discretionary_risk_pct=discretionary_risk_pct,
-            capital=initial_cap
+            capital=initial_cap,
+            debug=True
         )
-        trader = TraderMorningModel(config)
-        summary = trader.run_morning_routine(snapshot)
-        st.write("### Morning Model Summary")
+        morning_model = TraderMorningModel(cfg)
+        summary = morning_model.run_morning_routine(snapshot)
+
+        st.subheader("Morning Model Summary")
         st.json(summary)
 
-        # ---------------------------
-        # Backtest (adjust allocation if discrepancy flagged)
-        # ---------------------------
-        allocation_pct = 0.5
-        if summary['discrepancy']['flag']:
-            allocation_pct = 0.25
-            st.warning("Morning model flagged discrepancy → scaling allocation to 25%")
+        discrepancy_flag = summary["discrepancy"]["flag"]
+        alloc_pct = 0.25 if discrepancy_flag else 0.50
+        st.write(f"**Backtest allocation scaling:** {alloc_pct*100:.0f}% of capital")
 
-        bt_engine = SimpleShortBacktest(initial_capital=initial_cap,
-                                        slippage_bps=slippage_bps,
-                                        margin_rate=margin_rate,
-                                        allocation_pct=allocation_pct)
-        bt_results = bt_engine.run(price_data, calendar)
+        # ---------------------------
+        # Run backtest
+        # ---------------------------
+        engine = SimpleShortBacktest(
+            initial_capital=initial_cap,
+            slippage_bps=slippage_bps,
+            margin_rate=margin_rate,
+            allocation_pct=alloc_pct
+        )
+        results = engine.run(price_data, calendar)
 
-        st.write("### Equity Curve")
-        st.line_chart(bt_results["equity"]["equity"])
-        st.write("### Metrics")
-        st.json(bt_results["metrics"])
-        st.write("### Trades")
-        st.dataframe(bt_results["trades"].tail(20))
+        st.subheader("Backtest Metrics")
+        st.json(results["metrics"])
+
+        st.subheader("Equity Curve")
+        st.line_chart(results["equity"][["equity", "required_margin"]])
+
+        st.subheader("Trades")
+        st.dataframe(results["trades"])
+
+        # ---------------------------
+        # Export YAML + placeholder PDF
+        # ---------------------------
+        yaml_doc = {
+            "run_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "preset": SCENARIO["preset"],
+            "scenario": SCENARIO["label"],
+            "date_range": {"start": SCENARIO["start"], "end": SCENARIO["end"]},
+            "strategy": "momentum_breakdown_short_v1",
+            "notes": f"Scenario label: {SCENARIO['label']}. Morning model flag={discrepancy_flag}."
+        }
+        yml_path = DOCS / f"{datetime.utcnow().strftime('%Y%m%d')}__{SCENARIO['tag']}__momentum.yml"
+        with open(yml_path, "w") as f:
+            yaml.safe_dump(yaml_doc, f)
+        st.success(f"Saved YAML config to {yml_path}")
+
+        pdf_path = DOCS / f"{datetime.utcnow().strftime('%Y%m%d')}__{SCENARIO['tag']}__momentum.pdf"
+        c = canvas.Canvas(str(pdf_path), pagesize=letter)
+        c.drawString(100, 750, "Backtest Report")
+        c.drawString(100, 730, f"Scenario: {SCENARIO['label']}")
+        c.drawString(100, 710, f"Metrics: {results['metrics']}")
+        c.save()
+        st.success(f"Saved placeholder PDF report to {pdf_path}")
