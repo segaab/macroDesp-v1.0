@@ -7,3 +7,4 @@ matplotlib
 reportlab
 scipy
 huggingface_hub
+yahooquery 
