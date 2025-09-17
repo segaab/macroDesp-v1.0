@@ -1,9 +1,10 @@
-# complacency_index_diagnostics_fixed.py
+# complacency_index_diagnostics_fixed_v2.py
 """
-Diagnostics + Complacency Index test app (fixed).
+Diagnostics + Complacency Index test app (fixed v2).
 - Uses yahooquery fetch wrapper (user-provided style)
 - Uses FRED (fredapi if available, else HTTP fallback)
-- Computes rel-vol, realized vol (fixed to return Series), z-scores, and Complacency Index
+- Computes rel-vol, realized vol, z-scores, and Complacency Index
+- Robust assignment to avoid pandas 2D-to-1D errors
 """
 import os
 from datetime import datetime
@@ -11,6 +12,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import warnings
 
 # yahooquery is required for price fetch
 from yahooquery import Ticker
@@ -22,6 +24,66 @@ try:
 except Exception:
     Fred = None
     HAS_FREDAPI = False
+
+# ---------------------------
+# Safe helper to convert Series/DataFrame to 1D numpy array aligned to a target index
+# ---------------------------
+def to_1d_array(obj, target_index):
+    """
+    Accepts a pandas Series or DataFrame `obj` (or numpy array-like).
+    Returns a 1D numpy array aligned to `target_index` length.
+    If obj is a DataFrame with multiple columns, picks first non-nan column and logs a warning.
+    """
+    # If DataFrame, choose a column
+    if isinstance(obj, pd.DataFrame):
+        if obj.shape[1] == 1:
+            ser = obj.iloc[:, 0]
+        else:
+            # pick first column with the fewest nans
+            non_nan_counts = obj.notna().sum()
+            best_col = non_nan_counts.idxmax()
+            warnings.warn(f"to_1d_array: DataFrame with multiple columns provided; selecting column '{best_col}'.")
+            ser = obj[best_col]
+    elif isinstance(obj, pd.Series):
+        ser = obj
+    else:
+        # numpy array or list
+        arr = np.asarray(obj)
+        if arr.ndim == 1:
+            if len(arr) != len(target_index):
+                # try broadcast or truncate/pad
+                if arr.size == 1:
+                    return np.repeat(arr.item(), len(target_index))
+                else:
+                    # try to reshape if possible
+                    arr = arr.ravel()
+            return arr.ravel()
+        elif arr.ndim == 2:
+            # pick first column
+            warnings.warn("to_1d_array: numpy array with ndim==2 provided; selecting first column.")
+            arr1 = arr[:, 0]
+            if arr1.size != len(target_index):
+                # try to reindexable? fallback to repeat/truncate
+                if arr1.size < len(target_index):
+                    return np.pad(arr1, (0, len(target_index) - arr1.size), constant_values=np.nan)
+                else:
+                    return arr1[: len(target_index)]
+            return arr1
+        else:
+            return np.full(len(target_index), np.nan)
+
+    # align to target_index
+    ser = ser.reindex(target_index).copy()
+    # if dtype is datetime-like accidentally, convert
+    if not np.issubdtype(ser.dtype, np.number):
+        try:
+            ser = pd.to_numeric(ser)
+        except Exception:
+            pass
+    arr = ser.to_numpy()
+    if arr.ndim > 1:
+        arr = arr.ravel()
+    return arr
 
 # ---------------------------
 # User-provided yahoo fetch function (kept as requested)
@@ -141,7 +203,7 @@ def get_fred_series(series_id: str, start: str, end: str) -> pd.Series:
     return pd.Series(dtype=float)
 
 # ---------------------------
-# Computation helpers (fixed realized_vol returns Series)
+# Computation helpers
 # ---------------------------
 def compute_rel_volume(df: pd.DataFrame, lookback: int = 50) -> pd.DataFrame:
     df = df.copy()
@@ -152,17 +214,15 @@ def compute_rel_volume(df: pd.DataFrame, lookback: int = 50) -> pd.DataFrame:
 def realized_vol(df: pd.DataFrame, window: int = 20) -> pd.Series:
     """
     Return a Series (indexed like df.index) with annualized realized volatility (%).
-    Always returns a Series to avoid pandas multi-column assignment errors.
     """
-    # guard: if Close missing, create a flat series
     if "Close" not in df.columns:
         s_close = pd.Series(0.0, index=df.index)
     else:
         s_close = df["Close"].astype(float).copy()
     rets = s_close.pct_change().fillna(0.0)
     rv = rets.rolling(window, min_periods=1).std() * np.sqrt(252) * 100.0
-    rv = rv.reindex(df.index)  # ensure index alignment
-    rv.name = "RealizedVol20"
+    rv = rv.reindex(df.index)
+    rv.name = "RealizedVol"
     return rv.fillna(0.0)
 
 def zscore(series: pd.Series, baseline_days: int = 252) -> pd.Series:
@@ -176,18 +236,6 @@ def map_to_0_10(x, cap: float = 6.0):
     return 10.0 * np.clip(x, 0.0, cap) / cap
 
 # Sub-score helpers
-def compute_FDS(defaults_z: pd.Series, yield_z: pd.Series, price_r5_z: pd.Series):
-    raw = (defaults_z.fillna(0.0) + yield_z.fillna(0.0) - price_r5_z.fillna(0.0)).clip(lower=0.0)
-    return map_to_0_10(raw)
-
-def compute_VFS(vol_rel: pd.Series, r5_abs: pd.Series):
-    m = (np.maximum(0.0, vol_rel - 1.0) / (1.0 + r5_abs)).fillna(0.0)
-    return map_to_0_10(m, cap=4.0)
-
-def compute_VSS(stress_z: pd.Series, vol_z: pd.Series):
-    raw = (stress_z.fillna(0.0) - vol_z.fillna(0.0)).clip(lower=0.0)
-    return map_to_0_10(raw)
-
 def compute_NTS_from_finbert(neg_frac: float):
     if neg_frac < 0.2:
         return 10.0
@@ -198,8 +246,8 @@ def compute_NTS_from_finbert(neg_frac: float):
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.set_page_config(layout="wide", page_title="Complacency Index Diagnostics (fixed)")
-st.title("Complacency Index — Diagnostics & Testing (fixed)")
+st.set_page_config(layout="wide", page_title="Complacency Index Diagnostics (fixed v2)")
+st.title("Complacency Index — Diagnostics & Testing (fixed v2)")
 
 with st.sidebar:
     st.header("Controls")
@@ -247,10 +295,9 @@ if run_button:
         per_sym_tables = {}
         for sym, df in price_data.items():
             dfc = compute_rel_volume(df, lookback=vol_lookback)
-            # realized_vol returns a Series aligned to df index
             rv_series = realized_vol(dfc, window=rv_window)
-            # assign safely using .values (index-aligned)
-            dfc["RealizedVol20"] = rv_series.reindex(dfc.index).values
+            # assign realized vol safely
+            dfc["RealizedVol20"] = to_1d_array(rv_series, dfc.index)
             dfc["R5"] = dfc["Close"].pct_change(5).fillna(0.0)
             dfc["AbsR5"] = dfc["R5"].abs()
             per_sym_tables[sym] = dfc[["Close","Volume","VolAvg50","VolRel","RealizedVol20","R5","AbsR5"]].copy()
@@ -272,19 +319,20 @@ if run_button:
 
         # diagnostics DataFrame
         diag = pd.DataFrame(index=cal)
-        diag["DGS10"] = dgs10.values
-        diag["DRSFRMACBS"] = drs.values
+        diag["DGS10"] = to_1d_array(dgs10, diag.index)
+        diag["DRSFRMACBS"] = to_1d_array(drs, diag.index)
 
+        # safely add per-symbol cols (use to_1d_array for robustness)
         for sym, tab in per_sym_tables.items():
-            diag[f"{sym}_Close"] = tab["Close"].values
-            diag[f"{sym}_VolRel"] = tab["VolRel"].values
-            diag[f"{sym}_RV20"] = tab["RealizedVol20"].values
-            diag[f"{sym}_R5"] = tab["R5"].values
-            diag[f"{sym}_AbsR5"] = tab["AbsR5"].values
+            diag[f"{sym}_Close"] = to_1d_array(tab[["Close"]] if isinstance(tab, pd.DataFrame) else tab["Close"], diag.index)
+            diag[f"{sym}_VolRel"] = to_1d_array(tab[["VolRel"]] if isinstance(tab, pd.DataFrame) else tab["VolRel"], diag.index)
+            diag[f"{sym}_RV20"] = to_1d_array(tab[["RealizedVol20"]] if isinstance(tab, pd.DataFrame) else tab["RealizedVol20"], diag.index)
+            diag[f"{sym}_R5"] = to_1d_array(tab[["R5"]] if isinstance(tab, pd.DataFrame) else tab["R5"], diag.index)
+            diag[f"{sym}_AbsR5"] = to_1d_array(tab[["AbsR5"]] if isinstance(tab, pd.DataFrame) else tab["AbsR5"], diag.index)
 
         # compute z-scores
-        diag["z_defaults"] = zscore(diag["DRSFRMACBS"], baseline_days=baseline_days)
-        diag["z_yield"] = zscore(diag["DGS10"], baseline_days=baseline_days)
+        diag["z_defaults"] = zscore(pd.Series(diag["DRSFRMACBS"], index=diag.index), baseline_days=baseline_days)
+        diag["z_yield"] = zscore(pd.Series(diag["DGS10"], index=diag.index), baseline_days=baseline_days)
 
         primary_sym = symbols[0]
         diag["price_r5"] = diag.get(f"{primary_sym}_R5", pd.Series(index=diag.index, data=0.0))
@@ -297,7 +345,7 @@ if run_button:
         for sym in symbols:
             col_rv = f"{sym}_RV20"
             if col_rv in diag.columns:
-                diag[f"{sym}_z_rv"] = zscore(diag[col_rv], baseline_days=baseline_days)
+                diag[f"{sym}_z_rv"] = zscore(pd.Series(diag[col_rv], index=diag.index), baseline_days=baseline_days)
                 rv_zs.append(diag[f"{sym}_z_rv"])
         if rv_zs:
             rv_z_df = pd.concat(rv_zs, axis=1).fillna(0.0)
@@ -312,10 +360,10 @@ if run_button:
         # VFS raw per asset and aggregated
         per_asset_m = []
         for sym in symbols:
-            volrel = diag.get(f"{sym}_VolRel", pd.Series(index=diag.index, data=1.0)).fillna(1.0)
-            absr5 = diag.get(f"{sym}_AbsR5", pd.Series(index=diag.index, data=0.0)).fillna(0.0)
+            volrel = pd.Series(diag.get(f"{sym}_VolRel", pd.Series(index=diag.index, data=1.0))).fillna(1.0)
+            absr5 = pd.Series(diag.get(f"{sym}_AbsR5", pd.Series(index=diag.index, data=0.0))).fillna(0.0)
             m = (np.maximum(0.0, volrel - 1.0) / (1.0 + absr5)).fillna(0.0)
-            diag[f"{sym}_VFS_raw"] = m
+            diag[f"{sym}_VFS_raw"] = to_1d_array(m, diag.index)
             per_asset_m.append(m)
         if per_asset_m:
             m_df = pd.concat(per_asset_m, axis=1)
