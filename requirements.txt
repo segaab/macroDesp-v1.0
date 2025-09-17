@@ -8,3 +8,4 @@ reportlab
 scipy
 huggingface_hub
 yahooquery 
+fredapi
